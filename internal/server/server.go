@@ -2,17 +2,27 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	models "github.com/Tamara-Shep/TrainingInBrunoyamGo/internal/domain/model"
 	"github.com/Tamara-Shep/TrainingInBrunoyamGo/internal/storage"
-
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
+	"golang.org/x/crypto/bcrypt"
 )
 
+const SecretKey = "VerySecretKey2000"
+
+type Claims struct {
+	jwt.RegisteredClaims
+	UserID string
+}
+
 type Storage interface {
-	SaveUser(models.User) error
-	ValidateUser(models.User) (string, error)
+	SaveUser(models.User) (string, error)
+	ValidateUser(models.User) (string, string, error)
 	GetBooks() ([]models.Book, error)
 	GetBookId(string) (models.Book, error)
 	SaveBook(models.Book) error
@@ -59,10 +69,25 @@ func (s *Server) RegisterHandler(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.storage.SaveUser(user); err != nil {
+	passHash, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+
+	}
+	user.Password = string(passHash)
+
+	UID, err := s.storage.SaveUser(user)
+	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	token, err := createJWT(UID)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.Header("Authorization", token)
 	ctx.String(http.StatusOK, "User was saved")
 }
 
@@ -72,7 +97,7 @@ func (s *Server) AuthHandler(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	_, err := s.storage.ValidateUser(user)
+	UID, password, err := s.storage.ValidateUser(user)
 	if err != nil {
 		if errors.Is(err, storage.ErrIvalidAuthData) {
 			ctx.String(http.StatusUnauthorized, err.Error())
@@ -81,7 +106,18 @@ func (s *Server) AuthHandler(ctx *gin.Context) {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	ctx.String(http.StatusOK, "Auth compltted")
+	if err = bcrypt.CompareHashAndPassword([]byte(password), []byte(user.Password)); err != nil {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "Неверная пара логин пароль"})
+		return
+	}
+
+	token, err := createJWT(UID)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.Header("Authorization", token)
+	ctx.String(http.StatusOK, "Auth completted")
 }
 
 func (s *Server) AllBookHandler(ctx *gin.Context) {
@@ -136,4 +172,34 @@ func (s *Server) DeleteBookHandler(ctx *gin.Context) {
 		return
 	}
 	ctx.String(http.StatusOK, "book was delete")
+}
+
+func createJWT(UID string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour * 3)),
+		},
+		UserID: UID,
+	})
+	key := []byte(SecretKey)
+	tokenStr, err := token.SignedString(key)
+	if err != nil {
+		return "", err
+	}
+	return tokenStr, err
+}
+
+func getUID(tokenStr string) (string, error) {
+	claims := Claims{}
+
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+		return []byte(SecretKey), nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if !token.Valid {
+		return "", fmt.Errorf("invalid token")
+	}
+	return claims.UserID, nil
 }
